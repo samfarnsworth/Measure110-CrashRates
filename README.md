@@ -1,0 +1,2 @@
+Thank you for reading my thesis! This repository contains the data needed to replicate the analyses presented in my master's thesis on the impact of Oregon’s Measure 110 on vehicle crash rates. The study uses a synthetic difference-in-differences (DID) approach and includes comparisons with traditional regression DID models. The Excel file the research relied on (and linked here) contains data I manually collected by combing through crash reports produced by different Departments of Transportation.
+
