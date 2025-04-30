@@ -1,0 +1,506 @@
+---
+title: "Farnsworth Thesis Code"
+output: html_document
+date: "2025-04-28"
+---
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(quadprog)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(showtext)
+library(sysfonts)
+library(future)
+library(future.apply)
+library(patchwork)
+library(lmtest)
+library(sandwich)
+plan(multisession)
+showtext_auto()
+font_add_google("Merriweather", "latexfont")
+```
+
+```{r}
+df <- read_xlsx("~/Downloads/FarnsworthCrashData (1).xlsx")
+
+# CALCULATE ATT
+
+# Set treated versus untreated states
+treated_state <- "Oregon"
+all_states <- setdiff(colnames(df_pre_wide), "date")
+donor_states <- setdiff(all_states, treated_state)
+
+# Format columns
+df <- df_raw %>%
+  rename_all(tolower) %>%
+  mutate(
+    month_num = match(tolower(month), tolower(month.abb)),
+    year = suppressWarnings(as.numeric(year))) %>%
+  filter(!is.na(year), !is.na(month_num)) %>%
+  mutate(
+    date = make_date(year, month_num, 1),
+    crash_rate = crashes / vmt)
+
+# Set pre- and post- periods
+policy_start <- as.Date("2020-11-01")
+df_pre <- df %>% filter(date < policy_start)
+df_post <- df %>% filter(date >= policy_start)
+
+# Pivot wide in the pre-period to prepare for the matrix minimization problem
+df_pre_wide <- df_pre %>%
+  select(date, state, crash_rate) %>%
+  pivot_wider(names_from = state, values_from = crash_rate, values_fn = sum)
+
+# Set y_o as the outcome vector for the treated unit in the pre-period
+y_o <- df_pre_wide[[treated_state]]
+
+# Set Y_d as the matrix of outcome vectors for donor states in the pre-period
+Y_d <- df_pre_wide[, donor_states] %>% as.matrix()
+
+# Define function for synthetic control
+scm_fit <- function(y, Y) {
+  Dmat <- 2 * t(Y) %*% Y
+  dvec <- 2 * t(Y) %*% y
+  Amat <- cbind(rep(1, ncol(Y)), diag(ncol(Y)))
+  bvec <- c(1, rep(0, ncol(Y)))
+  meq <- 1
+  sol <- solve.QP(Dmat, dvec, Amat, bvec, meq = meq)
+  sol$solution}
+
+# Minimize the squared error between Oregon and the donor states in the pre-period
+w_hat <- scm_fit(y_o, Y_d)
+
+# Display donor weights
+weights_df <- data.frame(donor = donor_states,
+  weight = round(w_hat, 4)) %>% 
+  arrange(desc(weight))
+  kable(weights_df, caption = "Donor Weights") %>%
+  kable_styling(latex_options = c("striped", "hold_position"))
+
+# Create synthetic Oregon from donor states and flag post-policy months
+df_wide_all <- df %>%
+  select(date, state, crash_rate) %>%
+  pivot_wider(names_from = state, values_from = crash_rate, values_fn = sum) %>%
+  mutate(synthetic = rowSums(across(all_of(donor_states), ~ .x * w_hat[which(donor_states == cur_column())])),
+    post = date >= ymd("2020-11-01"))
+
+# Apply scalar correction to match Oregon's level
+c <- mean(df_wide_all$Oregon[!df_wide_all$post], na.rm = TRUE) /
+     mean(df_wide_all$synthetic[!df_wide_all$post], na.rm = TRUE)
+
+# Caclulate the estimated difference between Oregon and synthetic control at each time point
+df_wide_all <- df_wide_all %>%
+  mutate(
+    synthetic_scaled = synthetic * c,
+    gap = Oregon - synthetic_scaled)
+
+# Compute average treatment gap before and after policy
+att_summary <- df_wide_all %>%
+  group_by(post) %>%
+  summarise(avg_gap = mean(gap, na.rm = TRUE), .groups = "drop")
+
+# Calculate ATT as the post-period average gap minus pre-period average gap
+att <- diff(att_summary$avg_gap)
+print(att)
+
+# Calculate pre-treatment MSPE
+pre_mspe <- df_wide_all %>%
+  filter(!post) %>%
+  summarise(
+    mspe = mean((Oregon - synthetic_scaled)^2, na.rm = TRUE),
+    rmse = sqrt(mspe),
+    mae = mean(abs(Oregon - synthetic_scaled), na.rm = TRUE))
+
+# Create a table to display the pre-treatment fit metrics
+fit_metrics_table <- tibble(
+  Metric = c("Mean Squared Prediction Error (MSPE)", 
+             "Root Mean Squared Error (RMSE)",
+             "Mean Absolute Error (MAE)"),
+  Value = c(round(pre_mspe$mspe, 6), round(pre_mspe$rmse, 6), round(pre_mspe$mae, 6)))
+
+kable(fit_metrics_table, caption = "Pre-Treatment Fit Quality Metrics") %>%
+kable_styling(latex_options = c("striped", "hold_position"))
+```
+
+```{r}
+# PLACEBO TESTS
+
+# Create storage for placebo ATT estimates
+placebo_att <- c()
+
+# Loop through each donor state and treat it as if it were "treated"
+for (state in donor_states) {
+
+# Construct synthetic control for placebo state
+y_placebo <- df_pre_wide[[state]]
+Y_d_placebo <- df_pre_wide[, setdiff(donor_states, state)] %>% as.matrix()
+
+# Estimate weights using earlier function
+w_placebo <- tryCatch({
+    scm_fit(y_placebo, Y_d_placebo)
+  }, error = function(e) return(NULL))
+
+# Create synthetic control for placebo-treated state
+if (!is.null(w_placebo)) {
+  synth_placebo <- as.matrix(df_wide_all[, setdiff(donor_states, state)]) %*% w_placebo
+  gap_placebo <- df_wide_all[[state]] - synth_placebo
+  post_period <- df_wide_all$date >= as.Date("2020-11-01")
+    
+# Compute placebo ATT and store it
+  placebo_ATT <- mean(gap_placebo[post_period], na.rm = TRUE)
+  placebo_att <- c(placebo_att, placebo_ATT)}}
+
+# Compute p-value by calculating share of placebo ATTs as extreme as Oregon's
+placebo_p_value <- mean(abs(placebo_att) >= abs(att))
+
+# Compute standard error using standard deviation of placebo ATTs
+se_placebo <- sd(placebo_att, na.rm = TRUE)
+
+print(placebo_p_value)
+print(se_placebo)
+
+# Compute pre- and post-treatment MSPEs for Oregon
+oregon_pre_mspe <- mean((df_wide_all$Oregon[!df_wide_all$post] - 
+                        df_wide_all$synthetic_scaled[!df_wide_all$post])^2, na.rm = TRUE)
+oregon_post_mspe <- mean((df_wide_all$Oregon[df_wide_all$post] - 
+                         df_wide_all$synthetic_scaled[df_wide_all$post])^2, na.rm = TRUE)
+oregon_mspe_ratio <- oregon_post_mspe / oregon_pre_mspe
+
+# Calculate MSPE ratios for all placebo states
+placebo_mspe_ratios <- c()
+placebo_pre_mspes <- c()
+state_names <- c()
+
+# Repeat synthetic control estimation for each placebo
+for (state in donor_states) {
+  y_placebo <- df_pre_wide[[state]]
+  Y_d_placebo <- df_pre_wide[, setdiff(donor_states, state)] %>% as.matrix()
+  
+  w_placebo <- tryCatch({
+    scm_fit(y_placebo, Y_d_placebo)
+  }, error = function(e) return(NULL))
+  
+  if (!is.null(w_placebo)) {
+    synth_placebo <- as.matrix(df_wide_all[, setdiff(donor_states, state)]) %*% w_placebo
+    
+# Compute pre- and post-MSPEs
+    pre_mspe <- mean((df_wide_all[[state]][!df_wide_all$post] - 
+                      synth_placebo[!df_wide_all$post])^2, na.rm = TRUE)
+    post_mspe <- mean((df_wide_all[[state]][df_wide_all$post] - 
+                       synth_placebo[df_wide_all$post])^2, na.rm = TRUE)
+
+# Store MSPE ratio if valid  
+    if (pre_mspe > 0) {
+      mspe_ratio <- post_mspe / pre_mspe
+      placebo_mspe_ratios <- c(placebo_mspe_ratios, mspe_ratio)
+      placebo_pre_mspes <- c(placebo_pre_mspes, pre_mspe)
+      state_names <- c(state_names, state)}}}
+
+# Create MSPE ratio comparison table
+mspe_ratio_df <- data.frame(
+  State = c("Oregon", state_names),
+  Pre_MSPE = c(oregon_pre_mspe, placebo_pre_mspes),
+  MSPE_Ratio = c(oregon_mspe_ratio, placebo_mspe_ratios)) %>% 
+  arrange(desc(MSPE_Ratio))
+
+# Display MSPE ratio table and Oregon's implied p-value
+kable(mspe_ratio_df, caption = "MSPE Ratio Comparison (Post/Pre)") %>%
+kable_styling(latex_options = c("striped", "hold_position"))
+```
+
+```{r}
+# CREATE PLOT
+
+# Prepare plot data by selecting Oregon and synthetic control crash rates, reshaping to long format
+df_plot <- df_wide_all %>%
+  select(date, Oregon, synthetic_scaled) %>%
+  pivot_longer(cols = c("Oregon", "synthetic_scaled"), names_to = "series", values_to = "crash_rate") %>%
+  filter(!is.na(crash_rate)) %>%
+  group_by(series) %>%
+  mutate(smoothed_rate = zoo::rollmean(crash_rate, k = 3, fill = NA, align = "center")) %>%
+  ungroup() %>%
+  mutate(series = recode(series, synthetic_scaled = "Synthetic Control"))
+
+# Plot crash rates over time with treatment date and shaded post-treatment region
+ggplot(df_plot, aes(x = date, y = smoothed_rate, color = series)) +
+  annotate("rect", xmin = as.Date("2020-11-01"), xmax = max(df_plot$date),
+           ymin = -Inf, ymax = Inf, fill = "gray90", alpha = 0.7) +
+  geom_line(size = 0.9) +
+  geom_vline(xintercept = as.Date("2020-11-01"), linetype = "dashed") +
+  annotate("text", x = as.Date("2020-11-01"),
+           y = max(df_plot$smoothed_rate, na.rm = TRUE),
+           label = "Measure 110", angle = 90, vjust = -0.5, hjust = 1.1,
+           size = 3.5, family = "latexfont") +
+  scale_y_continuous(name = "Crashes per Million VMT") +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  scale_color_manual(values = c("Oregon" = "#1b9e77", "Synthetic Control" = "#003366")) +
+  labs(x = "Year", color = "Group") +
+  theme_minimal(base_family = "latexfont") +
+  theme(
+    axis.title.x = element_text(margin = margin(t = 10)),
+    axis.title.y = element_text(margin = margin(r = 10)),
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+  )
+
+# Save file to folder
+ggsave("images/synthdid_plot_scaled.pdf", width = 8, height = 4, dpi = 300)
+```
+
+```{r}
+# SENSITIVITY ANALYSIS
+
+# Define three donor subsets
+subset_list <- list(
+  Neighbors = c("Washington", "Idaho", "California"),
+  Western_LowCrash = c("Washington", "Idaho", "Utah", "Colorado"),
+  Exclude_Washington = setdiff(donor_states, "Washington"))
+
+# Create empty lists to store results by subset
+  subset_results <- list()
+  weights_by_subset <- list()
+  se_by_subset <- list()
+  pval_by_subset <- list()
+  synth_series <- list()
+
+# Loop over each donor subset
+  for (label in names(subset_list)) {
+    donors_subset <- subset_list[[label]]
+
+# Reconstruct synthetic control for Oregon using the subset
+  y_oregon <- df_pre_wide$Oregon
+  Y_subset <- df_pre_wide[, donors_subset] %>% as.matrix()
+
+# Estimate weights using earlier function
+  w_subset <- tryCatch({
+  scm_fit(y_oregon, Y_subset)}, error = function(e) return(NULL))
+
+# Create synthetic control using subset
+  if (!is.null(w_subset)) {
+    synth_all <- as.matrix(df_wide_all[, donors_subset]) %*% w_subset
+    gap <- df_wide_all$Oregon - synth_all
+    post_period <- df_wide_all$date >= as.Date("2020-11-01")
+
+# Calculate ATT from the subset
+    ATT_subset <- mean(gap[post_period], na.rm = TRUE)
+
+# Calculate SE for each estimate using placebos
+    
+# Create empty vector to store placebo ATTs
+    placebo_ATT_subset <- c()
+    
+# Loop over each donor subset
+    for (pseudo_treated in donors_subset) {
+      y_pseudo <- df_pre_wide[[pseudo_treated]]
+      Y_pseudo <- df_pre_wide[, setdiff(donors_subset, pseudo_treated)] %>% as.matrix()
+
+# Estimate weights using earlier function
+      w_pseudo <- tryCatch({
+        scm_fit(y_pseudo, Y_pseudo)
+      }, error = function(e) NULL)
+
+# Create synthetic control for placebo-treated state
+      if (!is.null(w_pseudo)) {
+        synth_pseudo <- as.matrix(df_wide_all[, setdiff(donors_subset, pseudo_treated)]) %*% w_pseudo
+        gap_pseudo <- df_wide_all[[pseudo_treated]] - synth_pseudo
+        post_period <- df_wide_all$date >= as.Date("2020-11-01")
+
+# Calculate placebo ATT for each state in subset
+        placebo_att <- mean(gap_pseudo[post_period], na.rm = TRUE)
+        placebo_ATT_subset <- c(placebo_ATT_subset, placebo_att)}}
+
+# Calculate placebo-based SE and p-value for subset estimates
+  se_placebo_subset <- sd(placebo_ATT_subset, na.rm = TRUE)
+  pval_placebo_subset <- mean(abs(placebo_ATT_subset) >= abs(ATT_subset))
+
+# Store results
+  subset_results[[label]] <- ATT_subset
+  weights_by_subset[[label]] <- round(setNames(w_subset, donors_subset), 4)
+  se_by_subset[[label]] <- se_placebo_subset
+    pval_by_subset[[label]] <- pval_placebo_subset}}
+
+# Combine ATT, SE, and p-values into a summary table
+subset_df <- data.frame(
+  Subset = names(subset_results),
+  ATT_Estimate = round(unlist(subset_results), 4),
+  Std_Error = round(unlist(se_by_subset), 4),
+  Empirical_p_value = round(unlist(pval_by_subset), 4))
+
+# Reshape donor weights into long format for viewing
+weight_long <- do.call(rbind, lapply(names(weights_by_subset), function(nm) {
+  data.frame(
+    Subset = nm,
+    Donor = names(weights_by_subset[[nm]]),
+    Weight = unname(weights_by_subset[[nm]]))}))
+
+# Show ATT estimates and placebo-based inference for each subset
+kable(subset_df, caption = "Sensitivity Analysis by Donor Subset (Placebo-Based SE and p-values)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+# Show synthetic weights assigned to each donor in each subset
+kable(weight_long, caption = "Donor Weights by Subset") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+```{r}
+# PSEUDO-TREATMENT TEST
+
+# Set seed so the results of the sampling can be reproduced
+set.seed(1066)
+
+# Set cutoff for pseudo-treatment dates after 2015 so we have at least two years to create a synthetic control
+pseudo_periods <- df_pre$date[df_pre$date >= as.Date("2015-01-01")]
+n_placebo_draws <- 50  
+
+# Loop over each pseudo-treatment date and estimate synthetic control gaps
+pseudo_results_nested <- future_lapply(pseudo_periods, function(pseudo_date) {
+  
+# Filter training data before the pseudo-treatment date
+  df_train <- df_pre %>% filter(date < pseudo_date)
+  
+# Pivot training data to wide format
+  df_train_wide <- df_train %>%
+    select(date, state, crash_rate) %>%
+    pivot_wider(names_from = state, values_from = crash_rate, values_fn = sum)
+  if (nrow(df_train_wide) <= 2) {
+    return(list(ATT = NA, SE = NA, p_value = NA))}
+  
+# Construct synthetic Oregon from pre-pseudo data
+  y_oregon <- df_train_wide$Oregon
+  Y_d_oregon <- df_train_wide[, donor_states] %>% as.matrix()
+
+# Estimate weights using earlier function
+  w_hat_oregon <- tryCatch({
+    scm_fit(y_oregon, Y_d_oregon)
+  }, error = function(e) NULL)
+  
+# Transform dataset to apply synthetic control across full period
+  df_all_wide <- df_pre %>%
+    select(date, state, crash_rate) %>%
+    pivot_wider(names_from = state, values_from = crash_rate, values_fn = sum)
+
+# Create synthetic control before pseudo-treatment date
+  synthetic_series_oregon <- rowSums(as.matrix(df_all_wide[, donor_states]) *
+                                   matrix(rep(w_hat_oregon, each = nrow(df_all_wide)), ncol = length(donor_states)))
+
+# Scale so fake synthetic control matches fake treated unit 
+scalar_oregon <- mean(df_all_wide$Oregon[!df_all_wide$date >= pseudo_date], na.rm = TRUE) /
+                 mean(synthetic_series_oregon[!df_all_wide$date >= pseudo_date], na.rm = TRUE)
+synthetic_series_oregon_scaled <- synthetic_series_oregon * scalar_oregon
+
+# Compute the gap between actual and synthetic Oregon
+df_all_wide <- df_all_wide %>%
+  mutate(
+    synthetic_pseudo = synthetic_series_oregon_scaled,
+    gap_pseudo = Oregon - synthetic_pseudo,
+    post_pseudo = date >= pseudo_date)
+
+# Compute pseudo ATT
+  att_summary_pseudo <- df_all_wide %>%
+    group_by(post_pseudo) %>%
+    summarise(
+      avg_gap = mean(gap_pseudo, na.rm = TRUE),
+      .groups = "drop")
+  if (nrow(att_summary_pseudo) != 2) {
+    return(list(ATT = NA, SE = NA, p_value = NA))}
+  
+  att_oregon <- diff(att_summary_pseudo$avg_gap)
+  
+# Calculate SEs for pseudo treatment estimates using placebo-based inference
+
+# Create empty vector to store placebo ATTs
+  placebo_att_list <- c()
+
+# Loop over each donor state
+  for (draw in 1:n_placebo_draws) {
+    fake_treated <- sample(donor_states, 1)
+
+# Construct synthetic control for placebo state
+    Y_d_fake <- df_train_wide[, setdiff(donor_states, fake_treated)] %>% as.matrix()
+    y_fake <- df_train_wide[[fake_treated]]
+
+# Estimate weights using earlier function
+  w_hat_fake <- tryCatch({
+    scm_fit(y_fake, Y_d_fake)
+  }, error = function(e) NULL)
+
+# Create synthetic control for placebo-treated state
+  synthetic_series_fake <- rowSums(as.matrix(df_all_wide[, setdiff(donor_states, fake_treated)]) *
+    matrix(rep(w_hat_fake, each = nrow(df_all_wide)), ncol = length(setdiff(donor_states, fake_treated))))
+      
+# Scale each placebo's synthetic control to match its own pre-period mean
+  post_fake <- df_all_wide$date >= pseudo_date
+  scalar_fake <- mean(df_all_wide[[fake_treated]][!post_fake], na.rm = TRUE) /
+               mean(synthetic_series_fake[!post_fake], na.rm = TRUE)
+  synthetic_series_fake_scaled <- synthetic_series_fake * scalar_fake
+
+# Compute and store placebo ATT for this draw
+  gap_fake <- df_all_wide[[fake_treated]] - synthetic_series_fake_scaled
+  placebo_ATT <- mean(gap_fake[post_fake], na.rm = TRUE) - mean(gap_fake[!post_fake], na.rm = TRUE)
+  placebo_att_list <- c(placebo_att_list, placebo_ATT)}
+
+# Compute SE using distribution of placebo estimates
+  se_pseudo <- sd(placebo_att_list, na.rm = TRUE)
+  if (!is.na(att_oregon) & !is.na(se_pseudo) & se_pseudo > 0) {
+    z_val <- att_oregon / se_pseudo
+    p_val <- 2 * pnorm(-abs(z_val))
+  } else {
+    p_val <- NA}
+  
+# Return ATT, SE, and p-value as list for this pseudo-treatment period
+  list(ATT = att_oregon, SE = se_pseudo, p_value = p_val)
+}, future.seed = TRUE)
+
+# Merge results across all pseudo-treatment dates into a dataframe
+pseudo_results_nested_df <- data.frame(
+  Pseudo_Treatment_Date = pseudo_periods,
+  ATT = sapply(pseudo_results_nested, `[[`, "ATT"),
+  SE = sapply(pseudo_results_nested, `[[`, "SE"),
+  p_value = sapply(pseudo_results_nested, `[[`, "p_value"))
+
+# Display results
+kable(pseudo_results_nested_df, caption = "Nested Parallel Pseudo-Treatment Test Results") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+# Keep only one pseudo-treatment per month to prevent overplotting
+pseudo_results_filtered <- pseudo_results_nested_df %>%
+  mutate(month = lubridate::floor_date(Pseudo_Treatment_Date, "month")) %>%
+  group_by(month) %>%
+  slice(1) %>%
+  ungroup()
+
+# Plot pseudo-treatment ATT over time
+ggplot(pseudo_results_filtered, aes(x = month, y = ATT)) +
+  # Error bars WITH caps (default width is 0.5; use 0.2 for cleaner caps)
+  geom_errorbar(aes(ymin = ATT - 1.96 * SE, ymax = ATT + 1.96 * SE), width = 20, color = "black") +
+  geom_point(color = "blue") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+   scale_x_date(
+    date_breaks = "1 year",
+    date_labels = "%Y") +
+  labs(
+    x = "Pseudo-Treatment Date",
+    y = "Estimated ATT") +
+  theme_minimal(base_family = "latexfont")
+
+# Report the proportion of pseudo-treatments with p < 0.05
+n_significant_nested <- sum(pseudo_results_nested_df$p_value < 0.05, na.rm = TRUE)
+n_total_nested <- nrow(pseudo_results_nested_df)
+cat("\nOut of", n_total_nested, "pseudo-treatments,", n_significant_nested, 
+    "had p < 0.05 (", round(100 * n_significant_nested/n_total_nested, 2), "% ).\n")
+```
+
+```{r}
+# REGRESSION ESTIMATE
+
+# Run DID regression
+lm.DID <- lm(crash_rate ~ treated * post + vmt + factor(month_num), data = df)
+clustered_se <- vcovCL(model_covariates, cluster = ~state)
+coeftest(model_covariates, vcov = clustered_se)
+```
+
+
