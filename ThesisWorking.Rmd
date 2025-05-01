@@ -32,13 +32,8 @@ df <- read_xlsx("~/Downloads/FarnsworthCrashData (1).xlsx")
 ```{r}
 # CALCULATE ATT
 
-# Set treated versus untreated states
-treated_state <- "Oregon"
-all_states <- setdiff(colnames(df_pre_wide), "date")
-donor_states <- setdiff(all_states, treated_state)
-
 # Format columns
-df <- df_raw %>%
+df <- df %>%
   rename_all(tolower) %>%
   mutate(
     month_num = match(tolower(month), tolower(month.abb)),
@@ -57,6 +52,11 @@ df_post <- df %>% filter(date >= policy_start)
 df_pre_wide <- df_pre %>%
   select(date, state, crash_rate) %>%
   pivot_wider(names_from = state, values_from = crash_rate, values_fn = sum)
+
+# Set treated versus untreated states
+treated_state <- "Oregon"
+all_states <- setdiff(colnames(df_pre_wide), "date")
+donor_states <- setdiff(all_states, treated_state)
 
 # Set y_o as the outcome vector for the treated unit in the pre-period
 y_o <- df_pre_wide[[treated_state]]
@@ -620,7 +620,7 @@ ggsave("images/pseudo_treatment.pdf", width = 8, height = 4, dpi = 300)
 
 ```{r}
 # Define the real treatment result
-true_treatment_date <- as.Date("2021-11-01")
+true_treatment_date <- as.Date("2021-02-01")
 att_or <- -0.083
 se_or <- 0.371
 
