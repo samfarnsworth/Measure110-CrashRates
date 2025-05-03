@@ -161,7 +161,7 @@ w_placebo <- tryCatch({
 if (!is.null(w_placebo)) {
   synth_placebo <- as.matrix(df_wide_all[, setdiff(donor_states, state)]) %*% w_placebo
   gap_placebo <- df_wide_all[[state]] - synth_placebo
-  post_period <- df_wide_all$date >= as.Date("2020-11-01")
+  post_period <- df_wide_all$date >= as.Date("2021-02-01")
     
 # Compute placebo ATT and store it
   placebo_ATT <- mean(gap_placebo[post_period], na.rm = TRUE)
